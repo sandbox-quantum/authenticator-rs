@@ -58,6 +58,7 @@ pub struct ClientPIN {
     pub pin_protocol: Option<PinUvAuthProtocol>,
     pub subcommand: PINSubcommand,
     pub key_agreement: Option<COSEKey>,
+    pub key_agreement_pqc: Option<Vec<u8>>,
     pub pin_auth: Option<Vec<u8>>,
     pub new_pin_enc: Option<Vec<u8>>,
     pub pin_hash_enc: Option<Vec<u8>>,
@@ -71,6 +72,7 @@ impl Default for ClientPIN {
             pin_protocol: None,
             subcommand: PINSubcommand::GetPinRetries,
             key_agreement: None,
+            key_agreement_pqc: None,
             pin_auth: None,
             new_pin_enc: None,
             pin_hash_enc: None,
@@ -92,6 +94,9 @@ impl Serialize for ClientPIN {
             map_len += 1;
         }
         if self.key_agreement.is_some() {
+            map_len += 1;
+        }
+        if self.key_agreement_pqc.is_some() {
             map_len += 1;
         }
         if self.pin_auth.is_some() {
@@ -127,6 +132,9 @@ impl Serialize for ClientPIN {
         }
         if let Some(ref pin_hash_enc) = self.pin_hash_enc {
             map.serialize_entry(&6, Bytes::new(pin_hash_enc))?;
+        }
+        if let Some(ref key_agreement_pqc) = self.key_agreement_pqc {
+            map.serialize_entry(&7, Bytes::new(key_agreement_pqc))?;
         }
         if let Some(ref permissions) = self.permissions {
             map.serialize_entry(&9, permissions)?;
@@ -289,7 +297,8 @@ impl<'sc, 'pin> ClientPINSubCommand for GetPinToken<'sc, 'pin> {
         Ok(ClientPIN {
             pin_protocol: Some(self.shared_secret.pin_protocol.clone()),
             subcommand: PINSubcommand::GetPINToken,
-            key_agreement: Some(self.shared_secret.client_input().clone()),
+            key_agreement: self.shared_secret.client_input().cloned(),
+            key_agreement_pqc: self.shared_secret.kyber_ciphertext_input().cloned(),
             pin_hash_enc: Some(pin_hash_enc),
             ..ClientPIN::default()
         })
@@ -339,7 +348,7 @@ impl<'sc, 'pin> ClientPINSubCommand for GetPinUvAuthTokenUsingPinWithPermissions
         Ok(ClientPIN {
             pin_protocol: Some(self.shared_secret.pin_protocol.clone()),
             subcommand: PINSubcommand::GetPinUvAuthTokenUsingPinWithPermissions,
-            key_agreement: Some(self.shared_secret.client_input().clone()),
+            key_agreement: self.shared_secret.client_input().cloned(),
             pin_hash_enc: Some(pin_hash_enc),
             permissions: Some(self.permissions.bits()),
             rp_id: self.rp_id.clone(), /* TODO: This could probably be done less wasteful with
@@ -422,7 +431,7 @@ impl<'sc> ClientPINSubCommand for GetPinUvAuthTokenUsingUvWithPermissions<'sc> {
         Ok(ClientPIN {
             pin_protocol: Some(self.shared_secret.pin_protocol.clone()),
             subcommand: PINSubcommand::GetPinUvAuthTokenUsingUvWithPermissions,
-            key_agreement: Some(self.shared_secret.client_input().clone()),
+            key_agreement: self.shared_secret.client_input().cloned(),
             permissions: Some(self.permissions.bits()),
             rp_id: self.rp_id.clone(), /* TODO: This could probably be done less wasteful with
                                         * &str all the way */
@@ -478,7 +487,7 @@ impl<'sc, 'pin> ClientPINSubCommand for SetNewPin<'sc, 'pin> {
         Ok(ClientPIN {
             pin_protocol: Some(self.shared_secret.pin_protocol.clone()),
             subcommand: PINSubcommand::SetPIN,
-            key_agreement: Some(self.shared_secret.client_input().clone()),
+            key_agreement: self.shared_secret.client_input().cloned(),
             new_pin_enc: Some(new_pin_enc),
             pin_auth: Some(pin_auth),
             ..ClientPIN::default()
@@ -545,7 +554,8 @@ impl<'sc, 'pin> ClientPINSubCommand for ChangeExistingPin<'sc, 'pin> {
         Ok(ClientPIN {
             pin_protocol: Some(self.shared_secret.pin_protocol.clone()),
             subcommand: PINSubcommand::ChangePIN,
-            key_agreement: Some(self.shared_secret.client_input().clone()),
+            key_agreement: self.shared_secret.client_input().cloned(),
+            key_agreement_pqc: None,
             new_pin_enc: Some(new_pin_enc),
             pin_hash_enc: Some(pin_hash_enc),
             pin_auth: Some(pin_auth),
@@ -576,7 +586,12 @@ where
 
     fn wire_format(&self) -> Result<Vec<u8>, HIDError> {
         let client_pin = self.as_client_pin()?;
+        debug!(
+            "In wire_format func kyber_PQC {:?}",
+            client_pin.key_agreement_pqc
+        );
         let output = to_vec(&client_pin).map_err(CommandError::Serializing)?;
+        debug!("client subcommmand: {:04X?}", &output);
         trace!("client subcommmand: {:04X?}", &output);
 
         Ok(output)
