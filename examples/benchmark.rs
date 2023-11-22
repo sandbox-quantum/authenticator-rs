@@ -1,0 +1,338 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+use authenticator::{
+    authenticatorservice::{
+        AuthenticatorService, GetAssertionExtensions, HmacSecretExtension,
+        MakeCredentialsExtensions, RegisterArgs, SignArgs,
+    },
+    crypto::COSEAlgorithm,
+    ctap2::server::{
+        PublicKeyCredentialDescriptor, PublicKeyCredentialParameters, RelyingParty,
+        ResidentKeyRequirement, Transport, User, UserVerificationRequirement,
+    },
+    statecallback::StateCallback,
+    Pin, RegisterResult, SignResult, StatusPinUv, StatusUpdate,
+};
+use getopts::Options;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::mpsc::{channel, RecvError, Sender};
+use std::{env, thread};
+use time::OffsetDateTime;
+
+fn print_usage(program: &str, opts: Options) {
+    let brief = format!("Usage: {program} [options]");
+    print!("{}", opts.usage(&brief));
+}
+
+fn register(
+    ctap_args: &RegisterArgs,
+    manager: &mut AuthenticatorService,
+    status_tx: &Sender<StatusUpdate>,
+    timeout_ms: u64,
+) -> authenticator::ctap2::attestation::AttestationObject {
+    let attestation_object;
+    loop {
+        let (register_tx, register_rx) = channel();
+        let callback = StateCallback::new(Box::new(move |rv| {
+            register_tx.send(rv).unwrap();
+        }));
+
+        if let Err(e) = manager.register(timeout_ms, ctap_args.clone(), status_tx.clone(), callback)
+        {
+            panic!("Couldn't register: {:?}", e);
+        };
+
+        let register_result = register_rx
+            .recv()
+            .expect("Problem receiving, unable to continue");
+        match register_result {
+            Ok(RegisterResult::CTAP1(_, _)) => panic!("Requested CTAP2, but got CTAP1 results!"),
+            Ok(RegisterResult::CTAP2(a)) => {
+                attestation_object = a;
+                break;
+            }
+            Err(e) => panic!("Registration failed: {:?}", e),
+        };
+    }
+
+    //println!("Register result: {:?}", &attestation_object);
+
+    attestation_object
+}
+
+fn authenticate(
+    ctap_args: &SignArgs,
+    manager: &mut AuthenticatorService,
+    status_tx: &Sender<StatusUpdate>,
+    timeout_ms: u64,
+) {
+    loop {
+        let (sign_tx, sign_rx) = channel();
+
+        let callback = StateCallback::new(Box::new(move |rv| {
+            sign_tx.send(rv).unwrap();
+        }));
+
+        if let Err(e) = manager.sign(timeout_ms, ctap_args.clone(), status_tx.clone(), callback) {
+            panic!("Couldn't sign: {:?}", e);
+        }
+
+        let sign_result = sign_rx
+            .recv()
+            .expect("Problem receiving, unable to continue");
+
+        match sign_result {
+            Ok(SignResult::CTAP1(..)) => panic!("Requested CTAP2, but got CTAP1 sign results!"),
+            Ok(SignResult::CTAP2(_assertion_object)) => {
+                break;
+            }
+            Err(e) => panic!("Signing failed: {:?}", e),
+        }
+    }
+}
+
+fn main() {
+    env_logger::init();
+
+    let args: Vec<String> = env::args().collect();
+    let program = args[0].clone();
+
+    let mut opts = Options::new();
+    opts.optflag("x", "no-u2f-usb-hid", "do not enable u2f-usb-hid platforms");
+    opts.optflag("h", "help", "print this help menu").optopt(
+        "t",
+        "timeout",
+        "timeout in seconds",
+        "SEC",
+    );
+    opts.optflag("s", "hmac_secret", "With hmac-secret");
+    opts.optflag("h", "help", "print this help menu");
+    opts.optflag("f", "fallback", "Use CTAP1 fallback implementation");
+    opts.optopt("a", "algorithm", "Registration algorithm", "ALGO");
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(f) => panic!("{}", f.to_string()),
+    };
+    if matches.opt_present("help") {
+        print_usage(&program, opts);
+        return;
+    }
+    let algorithms = HashMap::from([
+        ("es256", COSEAlgorithm::ES256),
+        ("rs256", COSEAlgorithm::RS256),
+        ("ecdh", COSEAlgorithm::ECDH_ES_HKDF256),
+        ("kyber768", COSEAlgorithm::KYBER768),
+        ("crydi3", COSEAlgorithm::CRYDI3),
+    ]);
+    let pub_cred_params = match matches.opt_default("algorithm", "") {
+        Some(algo) => {
+            if let Some(alg) = algorithms.get(algo.to_lowercase().as_str()) {
+                vec![PublicKeyCredentialParameters { alg: *alg }]
+            } else {
+                panic!("invalid algorithm {}", algo)
+            }
+        }
+        None => algorithms
+            .values()
+            .map(|alg| PublicKeyCredentialParameters { alg: *alg })
+            .collect(),
+    };
+
+    let mut manager =
+        AuthenticatorService::new().expect("The auth service should initialize safely");
+
+    if !matches.opt_present("no-u2f-usb-hid") {
+        manager.add_u2f_usb_hid_platform_transports();
+    }
+
+    let fallback = matches.opt_present("fallback");
+
+    let timeout_ms = match matches.opt_get_default::<u64>("timeout", 25) {
+        Ok(timeout_s) => {
+            println!("Using {}s as the timeout", &timeout_s);
+            timeout_s * 1_000
+        }
+        Err(e) => {
+            println!("{e}");
+            print_usage(&program, opts);
+            return;
+        }
+    };
+
+    println!("Asking a security key to register now...");
+    let challenge_str = format!(
+        "{}{}",
+        r#"{"challenge": "1vQ9mxionq0ngCnjD-wTsv1zUSrGRtFqG2xP09SbZ70","#,
+        r#" "version": "U2F_V2", "appId": "http://example.com"}"#
+    );
+    let mut challenge = Sha256::new();
+    challenge.update(challenge_str.as_bytes());
+    let chall_bytes: [u8; 32] = challenge.finalize().into();
+
+    let (status_tx, status_rx) = channel::<StatusUpdate>();
+    thread::spawn(move || loop {
+        match status_rx.recv() {
+            Ok(StatusUpdate::InteractiveManagement(..)) => {
+                panic!("STATUS: This can't happen when doing non-interactive usage");
+            }
+            Ok(StatusUpdate::SelectDeviceNotice) => {
+                println!("STATUS: Please select a device by touching one of them.");
+            }
+            Ok(StatusUpdate::PresenceRequired) => {
+                println!("STATUS: waiting for user presence");
+            }
+            Ok(StatusUpdate::PinUvError(StatusPinUv::PinRequired(sender))) => {
+                let raw_pin =
+                    rpassword::prompt_password_stderr("Enter PIN: ").expect("Failed to read PIN");
+                sender.send(Pin::new(&raw_pin)).expect("Failed to send PIN");
+                continue;
+            }
+            Ok(StatusUpdate::PinUvError(StatusPinUv::InvalidPin(sender, attempts))) => {
+                println!(
+                    "Wrong PIN! {}",
+                    attempts.map_or("Try again.".to_string(), |a| format!(
+                        "You have {a} attempts left."
+                    ))
+                );
+                let raw_pin =
+                    rpassword::prompt_password_stderr("Enter PIN: ").expect("Failed to read PIN");
+                sender.send(Pin::new(&raw_pin)).expect("Failed to send PIN");
+                continue;
+            }
+            Ok(StatusUpdate::PinUvError(StatusPinUv::PinAuthBlocked)) => {
+                panic!("Too many failed attempts in one row. Your device has been temporarily blocked. Please unplug it and plug in again.")
+            }
+            Ok(StatusUpdate::PinUvError(StatusPinUv::PinBlocked)) => {
+                panic!("Too many failed attempts. Your device has been blocked. Reset it.")
+            }
+            Ok(StatusUpdate::PinUvError(StatusPinUv::InvalidUv(attempts))) => {
+                println!(
+                    "Wrong UV! {}",
+                    attempts.map_or("Try again.".to_string(), |a| format!(
+                        "You have {a} attempts left."
+                    ))
+                );
+                continue;
+            }
+            Ok(StatusUpdate::PinUvError(StatusPinUv::UvBlocked)) => {
+                println!("Too many failed UV-attempts.");
+                continue;
+            }
+            Ok(StatusUpdate::PinUvError(e)) => {
+                panic!("Unexpected error: {:?}", e)
+            }
+            Err(RecvError) => {
+                println!("STATUS: end");
+                return;
+            }
+        }
+    });
+
+    let user = User {
+        id: "user_id".as_bytes().to_vec(),
+        icon: None,
+        name: Some("A. User".to_string()),
+        display_name: None,
+    };
+    let origin = "https://example.com".to_string();
+    let ctap_args = RegisterArgs {
+        client_data_hash: chall_bytes,
+        relying_party: RelyingParty {
+            id: "example.com".to_string(),
+            name: None,
+            icon: None,
+        },
+        origin: origin.clone(),
+        user,
+        pub_cred_params,
+        exclude_list: vec![PublicKeyCredentialDescriptor {
+            id: vec![
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+                0x1c, 0x1d, 0x1e, 0x1f,
+            ],
+            transports: vec![Transport::USB, Transport::NFC],
+        }],
+        user_verification_req: UserVerificationRequirement::Preferred,
+        resident_key_req: ResidentKeyRequirement::Required,
+        extensions: MakeCredentialsExtensions {
+            hmac_secret: if matches.opt_present("hmac_secret") {
+                Some(true)
+            } else {
+                None
+            },
+            ..Default::default()
+        },
+        pin: None,
+        use_ctap1_fallback: fallback,
+    };
+
+    let mut n = 10;
+    let mut durations = Vec::with_capacity(n);
+    let attestation_object = loop {
+        let start = OffsetDateTime::now_utc();
+        let attestation_object = register(&ctap_args, &mut manager, &status_tx, timeout_ms);
+        let end = OffsetDateTime::now_utc();
+        durations.push((end - start).as_seconds_f64());
+        n -= 1;
+        if n == 0 {
+            break attestation_object;
+        }
+    };
+    println!("benchmark registration: {:?}", durations);
+
+    println!();
+    println!("*********************************************************************");
+    println!("Asking a security key to sign now, with the data from the register...");
+    println!("*********************************************************************");
+
+    let allow_list;
+    if let Some(cred_data) = attestation_object.auth_data.credential_data {
+        allow_list = vec![PublicKeyCredentialDescriptor {
+            id: cred_data.credential_id,
+            transports: vec![Transport::USB],
+        }];
+    } else {
+        allow_list = Vec::new();
+    }
+
+    let ctap_args = SignArgs {
+        client_data_hash: chall_bytes,
+        origin,
+        relying_party_id: "example.com".to_string(),
+        allow_list,
+        user_verification_req: UserVerificationRequirement::Preferred,
+        user_presence_req: true,
+        extensions: GetAssertionExtensions {
+            hmac_secret: if matches.opt_present("hmac_secret") {
+                Some(HmacSecretExtension::new(
+                    vec![
+                        0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0x10, 0x11, 0x12, 0x13,
+                        0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25,
+                        0x26, 0x27, 0x28, 0x29, 0x30, 0x31, 0x32, 0x33, 0x34,
+                    ],
+                    None,
+                ))
+            } else {
+                None
+            },
+        },
+        pin: None,
+        alternate_rp_id: None,
+        use_ctap1_fallback: fallback,
+    };
+
+    let n = 10;
+    let mut durations = Vec::with_capacity(n);
+    for _ in 0..n {
+        let start = OffsetDateTime::now_utc();
+        authenticate(&ctap_args, &mut manager, &status_tx, timeout_ms);
+        let end = OffsetDateTime::now_utc();
+        durations.push((end - start).as_seconds_f64());
+    }
+
+    println!("benchmark signature: {:?}", durations);
+}
