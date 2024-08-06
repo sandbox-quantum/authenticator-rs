@@ -585,6 +585,7 @@ pub enum COSEAlgorithm {
     ECDH_ES_HKDF256 = -25,             //     ECDH ES w/ HKDF - generate key directly
     KYBER768 = -24,                    //     ECDH ES w/ HKDF - generate key directly
     CRYDI3 = -20,                      //     Dilithium 3
+    FALCON512 = -21,                   //     Falcon-512
     SHAKE128 = -18,                    //     SHAKE-128 256-bit Hash Value
     SHA512_256 = -17,                  //     SHA-2 512-bit Hash truncated to 256-bits
     SHA256 = -16,                      //     SHA-2 256-bit Hash
@@ -657,6 +658,7 @@ impl Serialize for COSEAlgorithm {
             COSEAlgorithm::ECDH_ES_HKDF256 => serializer.serialize_i8(-25),
             COSEAlgorithm::KYBER768 => serializer.serialize_i8(-24),
             COSEAlgorithm::CRYDI3 => serializer.serialize_i8(-20),
+            COSEAlgorithm::FALCON512 => serializer.serialize_i8(-21),
             COSEAlgorithm::SHAKE128 => serializer.serialize_i8(-18),
             COSEAlgorithm::SHA512_256 => serializer.serialize_i8(-17),
             COSEAlgorithm::SHA256 => serializer.serialize_i8(-16),
@@ -757,6 +759,7 @@ impl TryFrom<i64> for COSEAlgorithm {
             -26 => Ok(COSEAlgorithm::ECDH_ES_HKDF512),
             -25 => Ok(COSEAlgorithm::ECDH_ES_HKDF256),
             -20 => Ok(COSEAlgorithm::CRYDI3),
+            -21 => Ok(COSEAlgorithm::FALCON512),
             -24 => Ok(COSEAlgorithm::KYBER768),
             -18 => Ok(COSEAlgorithm::SHAKE128),
             -17 => Ok(COSEAlgorithm::SHA512_256),
@@ -874,6 +877,13 @@ pub struct COSECRYDIL3Key {
 impl COSECRYDIL3Key {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct COSEFALCON512Key {
+    pub x: Vec<u8>,
+}
+
+impl COSEFALCON512Key {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct COSEPQCKEMKey {
     /// The public key.
     pub x: Vec<u8>,
@@ -931,6 +941,7 @@ pub enum COSEKeyTypeId {
     // PQC
     LWE = 5,
     PQCKEM = 6,
+    NTRU = 7,
 }
 
 impl TryFrom<u64> for COSEKeyTypeId {
@@ -943,6 +954,7 @@ impl TryFrom<u64> for COSEKeyTypeId {
             4 => Ok(COSEKeyTypeId::Symmetric),
             5 => Ok(COSEKeyTypeId::LWE),
             6 => Ok(COSEKeyTypeId::PQCKEM),
+            7 => Ok(COSEKeyTypeId::NTRU),
             _ => Err(CryptoError::UnknownKeyType),
         }
     }
@@ -974,6 +986,7 @@ pub enum COSEKeyType {
     // PQC KEM,
     CRYDI3(COSECRYDIL3Key),
     PQCKEM(COSEPQCKEMKey),
+    FALCON512(COSEFALCON512Key),
 }
 
 /// A COSE Key as provided by the Authenticator. You should never need
@@ -1121,6 +1134,10 @@ impl<'de> Deserialize<'de> for COSEKey {
                         info!("in deserialize CRYDI3");
                         COSEKeyType::CRYDI3(COSECRYDIL3Key { x })
                     }
+                    COSEKeyTypeId::NTRU => {
+                        info!("in deserialize FALCON512");
+                        COSEKeyType::FALCON512(COSEFALCON512Key { x })
+                    }
                     COSEKeyTypeId::PQCKEM => COSEKeyType::PQCKEM(COSEPQCKEMKey { x }),
                     COSEKeyTypeId::Symmetric => COSEKeyType::Symmetric(COSESymmetricKey { key: x }),
                 };
@@ -1144,6 +1161,7 @@ impl Serialize for COSEKey {
             COSEKeyType::Symmetric(_) => 3,
             COSEKeyType::PQCKEM(_) => 3,
             COSEKeyType::CRYDI3(_) => 3,
+            COSEKeyType::FALCON512(_) => 3,
         };
         let mut map = serializer.serialize_map(Some(map_len))?;
         match &self.key {
@@ -1178,6 +1196,11 @@ impl Serialize for COSEKey {
             }
             COSEKeyType::CRYDI3(key) => {
                 map.serialize_entry(&1, &(COSEKeyTypeId::LWE as u8))?;
+                map.serialize_entry(&3, &self.alg)?;
+                map.serialize_entry(&-2, &serde_bytes::Bytes::new(&key.x))?;
+            }
+            COSEKeyType::FALCON512(key) => {
+                map.serialize_entry(&1, &(COSEKeyTypeId::NTRU as u8))?;
                 map.serialize_entry(&3, &self.alg)?;
                 map.serialize_entry(&-2, &serde_bytes::Bytes::new(&key.x))?;
             }
